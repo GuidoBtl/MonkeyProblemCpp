@@ -8,7 +8,7 @@ Summary:     Different monkey processes synchronize through semaphores to cross
 
 Author:      Guido Bertolotti
 
-Revision:    1.0
+Revision:    1.1
 
 Date:        2017/04/12
 
@@ -213,74 +213,98 @@ time_t Time::seconds()
 /*******************************************************************************
 Class:       Sem
 
-Description: Semaphore functions wrappers.
-             Wrappers throw exceptions instead of returning an error value.
-             They are also easier to use.
+Description: Semaphore wrapper class.
+             Semaphores are objects of this class.
+             They throw exceptions instead of returning error values, and
+             are easier to use than the original library functions.
+
+             Sem(const char* semName, bool useExisting = true, int semValue = 1)
+             is the semaphore constructor.
+             semName = semaphore name (always starting with "/", e.g. "/MY_SEM";
+             useExisting = false to create a new semaphore, true (default) to use existing one;
+             semValue = new semaphore initial value, defaulting at 1.
+
+             The methods names are self-explaining (see semaphore.h man pages).
 *******************************************************************************/
 class Sem
 {
     public:
-        static sem_t* create  (const char* semName, int semValue);
-        static void   destroy (const char* semName);
+        Sem(const char* semName, bool useExisting = true, int semValue = 1);
 
-        static sem_t* open    (const char* semName);
-        static void   close   (sem_t* sem);
+        void   wait    ();
+        void   tryWait ();
+        void   post    ();
+        int    getValue();
 
-        static void   wait    (sem_t* sem);
-        static void   tryWait (sem_t* sem);
-        static void   post    (sem_t* sem);
-        static int    getValue(sem_t* sem);
+        ~Sem();
+
+    protected:
+        const char* semName;
+        sem_t*      sem;
+        bool        usingExisting;
+
+        // Id of the process which created the semaphore, the only one which can destroy it:
+        pid_t  creatorPid;
 };
 
-sem_t* Sem::create(const char* semName, int semValue)
+Sem::Sem(const char* semName, bool useExisting, int semValue)
 {
-    sem_t* sem;
-
-    if (semValue <= 0)
+    if (useExisting)
     {
-        throw std::invalid_argument("semValue <= 0");
+        if ((sem = sem_open(semName, SEM_FLAGS_USE)) < 0)
+        {
+            throw std::runtime_error("sem_open(semName, SEM_FLAGS_USE) failed");
+        }
+    }
+    else // !useExisting
+    {
+        if (semValue <= 0)
+        {
+            throw std::invalid_argument("semValue <= 0");
+        }
+
+        // Clean up semaphore in case it hang after a previous process break/abort:
+        if (sem_unlink(semName) == 0)
+        {
+            std::cerr << "Warning (previous process aborted?): semaphore " << semName << " was hanging." << std::endl;
+        }
+
+        if ((sem = sem_open(semName, SEM_FLAGS_CREATION, SEM_PERMISSIONS, semValue)) == SEM_FAILED)
+        {
+            throw std::runtime_error("sem_open(semName, SEM_FLAGS_CREATION, SEM_PERMISSIONS, semValue) failed");
+        }
+
+        // Store the creating process id:
+        creatorPid = getpid();
     }
 
-    // Clean up semaphore in case it hang after a break:
-    sem_unlink(semName);
-
-    if ((sem = sem_open(semName, SEM_FLAGS_CREATION, SEM_PERMISSIONS, semValue)) == SEM_FAILED)
-    {
-        throw std::runtime_error("sem_open(semName, SEM_FLAGS_CREATION, SEM_PERMISSIONS, semValue) failed");
-    }
-
-    return sem;
+    usingExisting = useExisting;
+    this->semName = semName;
 }
 
-void Sem::destroy(const char* semName)
+Sem::~Sem()
 {
-    if (sem_unlink(semName) < 0)
+    if (usingExisting)
     {
-        throw std::runtime_error("sem_unlink(semName) failed");
+        if (sem_close(sem) < 0)
+        {
+            throw std::runtime_error("(sem_close(sem) failed");
+        }
+    }
+    else // !usingExisting
+    {
+        // semaphore can only be destroyed by the process which created it:
+        if (getpid() == creatorPid)
+        {
+            if (sem_unlink(semName) < 0)
+            {
+                throw std::runtime_error("sem_unlink(semName) failed");
+            }
+        }
     }
 }
 
-sem_t* Sem::open(const char* semName)
-{
-    sem_t* sem;
-
-    if ((sem = sem_open(semName, SEM_FLAGS_USE)) < 0)
-    {
-        throw std::runtime_error("sem_open(semName, SEM_FLAGS_USE) failed");
-    }
-
-    return sem;
-}
-
-void Sem::close(sem_t* sem)
-{
-    if (sem_close(sem) < 0)
-    {
-        throw std::runtime_error("(sem_close(sem) failed");
-    }
-}
-
-void Sem::wait(sem_t* sem)
+void Sem::wait()
 {
     if (sem_wait(sem) < 0)
     {
@@ -288,7 +312,7 @@ void Sem::wait(sem_t* sem)
     }
 }
 
-void Sem::tryWait(sem_t* sem)
+void Sem::tryWait()
 {
     if (sem_trywait(sem) < 0 && errno != EAGAIN)
     {
@@ -296,7 +320,7 @@ void Sem::tryWait(sem_t* sem)
     }
 }
 
-void Sem::post(sem_t* sem)
+void Sem::post()
 {
     if (sem_post(sem) < 0)
     {
@@ -304,7 +328,7 @@ void Sem::post(sem_t* sem)
     }
 }
 
-int Sem::getValue(sem_t* sem)
+int Sem::getValue()
 {
     int value;
 
@@ -321,50 +345,50 @@ int Sem::getValue(sem_t* sem)
 Class:       Logger
 
 Description: This class prints log messages, with or without timestamps.
-             It is a singleton initialized on its first use.
              It takes care of concurrency issues and avoids mixing output
              from different processes.
 
 Methods:     static Logger& getInstance(const char* semNameLogger)
-             is the instance getter for class static methods.
+             is the instance getter for singleton static methods.
              It is not necessary to explicitly call this method.
              But this class uses a semaphore whose name is defined in
-             #define SEM_NAME_LOGGER_DEFAULT. To use a different name, call
-             defineSemaphoreName("/DESIRED_SEMAPHORE_NAME");
-             before any use of other class methods.
+             #define SEM_NAME_LOGGER_DEFAULT.
+             It is possible to use a different name by calling
+             getInstance("/DESIRED_SEMAPHORE_NAME")
+             before any other method of this class is firstly used.
 
              static void Logger::resetZeroTime()
-             defines current time as time 0 for timestamps. If not called,
-             time 0 is the time of first use of a class method.
+             explicitly defines current time as time 0 for next timestamps.
+             Can be called multiple times. If not called, time 0 is set as
+             the time in which a method of this class is firstly used.
 
-             static void Logger::print(const char* message, bool timestamp)
+             static void Logger::print(const char* message, bool includeTimestamp)
              writes a message to the log output, with or without timestamp.
 *******************************************************************************/
 class Logger
 {
     public:
-        static Logger& getInstance(const char* semNameLogger);
+        // static instance getter for singleton static methods:
+        static Logger& getInstance(const char* semNameLogger = SEM_NAME_LOGGER_DEFAULT);
+
+        // static method, wrapper for resetZeroTimeD():
         static void resetZeroTime();
-        static void print(const char* message, bool timestamp);
-        ~Logger();
+
+        // static method, wrapper for printD():
+        static void print(const char* message, bool includeTimestamp = false);
 
     protected:
-        // A semaphore is used to avoid mixing messages on log output
-        // Semaphore name:
-        const char* semNameLogger;
+        // A semaphore is used to avoid mixing messages on log output:
+        Sem semLogger;
 
-        // Semaphore pointer:
-        sem_t* semLogger;
-
-        // Reference time for timestamps:
+        // Zero time for timestamps:
         time_t zeroTime;
 
-        // Process id which created the logger, the only one which can destroy it:
-        pid_t  creatorPid;
-
+        // Stores current time as zero time to calculate relative time for timestamps:
         void resetZeroTimeD();
 
-        void printD(const char* message, bool timestamp);
+        // Writes a message to the log output, with or without timestamp:
+        void printD(const char* message, bool includeTimestamp);
 
     private:
         // Constructor is private for singleton:
@@ -373,58 +397,35 @@ class Logger
 
 Logger& Logger::getInstance(const char* semNameLogger)
 {
-    static Logger logger(semNameLogger);    // Singleton is instantiated on first use
+    // Singleton is instantiated on first use:
+    static Logger logger(semNameLogger);
+
     return logger;
 }
 
-Logger::Logger(const char* semNameLogger)
+Logger::Logger(const char* semNameLogger):
+        // Construct semaphore:
+        semLogger(semNameLogger, false)
 {
-    if (semNameLogger == NULL)
-    {
-        this->semNameLogger = SEM_NAME_LOGGER_DEFAULT;
-    }
-    else
-    {
-        this->semNameLogger = semNameLogger;
-    }
-
-    // Create and open named semaphore:
-    semLogger = Sem::create(this->semNameLogger, 1);
-
-    // Store the creating pid:
-    creatorPid = getpid();
-
     resetZeroTimeD();
-}
-
-Logger::~Logger()
-{
-    // logger can only be destroyed by the pid which created it:
-    if (getpid() == creatorPid)
-    {
-        // Destroy semaphore:
-        Sem::destroy(semNameLogger);
-    }
 }
 
 void Logger::resetZeroTimeD()
 {
-    // Store current time to calculate relative time for timestamps:
     zeroTime = Time::seconds();
 }
 
 void Logger::resetZeroTime()
 {
-    // Store current time to calculate relative time for timestamps:
-    Logger::getInstance(NULL).resetZeroTimeD();
+    Logger::getInstance().resetZeroTimeD();
 }
 
-void Logger::printD(const char* message, bool timestamp)
+void Logger::printD(const char* message, bool includeTimestamp)
 {
     // CRITICAL SECTION: BEGIN (guarantees exclusive access for std::clog to avoid mixing messages):
-    Sem::wait(semLogger);
+    semLogger.wait();
 
-    if (timestamp)
+    if (includeTimestamp)
     {
         // Print timestamp:
         std::clog << std::right << std::setfill('0') << std::setw(3) << (int)((Time::seconds() - zeroTime) % 1000) << ":";
@@ -434,12 +435,12 @@ void Logger::printD(const char* message, bool timestamp)
     std::clog << message << std::endl;
 
     // CRITICAL SECTION: END:
-    Sem::post(semLogger);
+    semLogger.post();
 }
 
-void Logger::print(const char* message, bool timestamp)
+void Logger::print(const char* message, bool includeTimestamp)
 {
-    Logger::getInstance(NULL).printD(message, timestamp);
+    Logger::getInstance().printD(message, includeTimestamp);
 }
 
 
@@ -449,13 +450,13 @@ Class:       Canyon
 Description: canyon equipped with rope and semaphores.
              Semaphores allow processes to cross the canyon without deadlocks.
 
-Methods:     inlinne getter methods with clear names.
+Methods:     The names of inline getter methods have clear meanings.
 *******************************************************************************/
 class Canyon
 {
     public:
         Canyon(const char* semNameQueueAB, const char* semNameQueueBA,    const char* semNameDirAB, const char* semNameDirBA,
-               const char* semNameDirExcl, const char* semNameFreePlaces, const char* semNameFreePlacesExcl, const int freePlaces);
+               const char* semNameDirExcl, const char* semNameFreePlaces, const char* semNameDirOtherExcl, const int freePlaces);
 
         const char* getSemNameQueueAB(void)
         {
@@ -487,17 +488,15 @@ class Canyon
             return semNameFreePlaces;
         };
 
-        const char* getSemNameFreePlacesExcl(void)
+        const char* getSemNameDirOtherExcl(void)
         {
-            return semNameFreePlacesExcl;
+            return semNameDirOtherExcl;
         };
 
-        const int getFreePlaces(void)
+        const int  getMaxFreePlaces(void)
         {
             return freePlaces;
         };
-
-        ~Canyon();
 
     protected:
         // Semaphores names:
@@ -507,63 +506,50 @@ class Canyon
         const char* semNameDirBA;           // Semaphore for the process ready to cross from B to A
         const char* semNameDirExcl;         // Semaphore to allow exclusive (atomic) access for operations on semDirAB and semDirBA semaphores
         const char* semNameFreePlaces;      // Semaphore to count remaining free places for processes crossing at the same time
-        const char* semNameFreePlacesExcl;  // Semaphore to allow exclusive (atomic) access for operations involving semFreePlaces semaphore
+        const char* semNameDirOtherExcl;    // Semaphore to allow exclusive (atomic) access for operations which lock/unlock the semaphore
+                                            // of the process's opposite travelling direction
 
-        // Semaphores pointers:
-        sem_t* semQueueAB;
-        sem_t* semQueueBA;
-        sem_t* semDirAB;
-        sem_t* semDirBA;
-        sem_t* semDirExcl;
-        sem_t* semFreePlaces;
-        sem_t* semFreePlacesExcl;
+        // Semaphores:
+        Sem semQueueAB;
+        Sem semQueueBA;
+        Sem semDirAB;
+        Sem semDirBA;
+        Sem semDirExcl;
+        Sem semFreePlaces;
+        Sem semDirOtherExcl;
 
-        // Places to cross at the same time (initial value of semFreePlaces):
-        int    freePlaces;
-
-        // Process id which created the canyon, the only one which can destroy it:
-        pid_t  creatorPid;
+        // Free places to cross the canyon at the same time:
+        int freePlaces;
 };
 
-Canyon::Canyon(const char* semNameQueueAB, const char* semNameQueueBA, const char* semNameDirAB, const char* semNameDirBA,
-               const char* semNameDirExcl, const char* semNameFreePlaces, const char* semNameFreePlacesExcl, const int freePlaces)
+Canyon::Canyon(const char*     semNameQueueAB,
+               const char*     semNameQueueBA,
+               const char*     semNameDirAB,
+               const char*     semNameDirBA,
+               const char*     semNameDirExcl,
+               const char*     semNameFreePlaces,
+               const char*     semNameDirOtherExcl,
+               const int       freePlaces):
+               // Construct named semaphores:
+               semQueueAB     (semNameQueueAB,      false),
+               semQueueBA     (semNameQueueBA,      false),
+               semDirAB       (semNameDirAB,        false),
+               semDirBA       (semNameDirBA,        false),
+               semDirExcl     (semNameDirExcl,      false),
+               semFreePlaces  (semNameFreePlaces,   false, freePlaces),
+               semDirOtherExcl(semNameDirOtherExcl, false)
 {
-    this->semNameQueueAB        = semNameQueueAB;
-    this->semNameQueueBA        = semNameQueueBA;
-    this->semNameDirAB          = semNameDirAB;
-    this->semNameDirBA          = semNameDirBA;
-    this->semNameDirExcl        = semNameDirExcl;
-    this->semNameFreePlaces     = semNameFreePlaces;
-    this->semNameFreePlacesExcl = semNameFreePlacesExcl;
+    // Store semaphores names:
+    this->semNameQueueAB      = semNameQueueAB;
+    this->semNameQueueBA      = semNameQueueBA;
+    this->semNameDirAB        = semNameDirAB;
+    this->semNameDirBA        = semNameDirBA;
+    this->semNameDirExcl      = semNameDirExcl;
+    this->semNameFreePlaces   = semNameFreePlaces;
+    this->semNameDirOtherExcl = semNameDirOtherExcl;
 
-    this->freePlaces            = freePlaces;
-
-    // Create and open named semaphores:
-    this->semQueueAB        = Sem::create(this->semNameQueueAB,        1);
-    this->semQueueBA        = Sem::create(this->semNameQueueBA,        1);
-    this->semDirAB          = Sem::create(this->semNameDirAB,          1);
-    this->semDirBA          = Sem::create(this->semNameDirBA,          1);
-    this->semDirExcl        = Sem::create(this->semNameDirExcl,        1);
-    this->semFreePlaces     = Sem::create(this->semNameFreePlaces,     this->freePlaces);
-    this->semFreePlacesExcl = Sem::create(this->semNameFreePlacesExcl, 1);
-
-    // Store the creating pid:
-    creatorPid = getpid();
-}
-
-Canyon::~Canyon()
-{
-    // Canyon can only be destroyed by the pid which created it:
-    if (getpid() == creatorPid)
-    {
-        // Destroy semaphores:
-        Sem::destroy(semNameQueueAB);
-        Sem::destroy(semNameQueueBA);
-        Sem::destroy(semNameDirAB);
-        Sem::destroy(semNameDirBA);
-        Sem::destroy(semNameDirExcl);
-        Sem::destroy(semNameFreePlaces);
-    }
+    // Store free places:
+    this->freePlaces = freePlaces;
 }
 
 
@@ -585,10 +571,11 @@ class Monkey
         {
             DIR_A_TO_B,
             DIR_B_TO_A,
-            DIR_NUMBER          // Total number of directions
+            DIR_NUMBER      // Total number of directions
         };
 
         Monkey(const int MonkeyId);
+
         void cross(Canyon canyon, Direction direction);
 
     protected:
@@ -600,9 +587,11 @@ class Monkey
             STATE_GOING_TO_ROPE,
             STATE_CROSSING_ON_ROPE,
             STATE_FINISHED_CROSSING,
-            STATE_NUMBER        // Total number of states
+            STATE_NUMBER    // Total number of states
         };
         int  monkeyId;
+
+        // Logs a direction-and-state depending message on the logging output:
         void logMessage(Direction direction, State state);
 };
 
@@ -613,50 +602,41 @@ Monkey::Monkey(const int monkeyId)
 
 void Monkey::cross(Canyon canyon, Direction direction)
 {
-    // Canyon semaphore pointers:
-    sem_t *semQueueOwn;         // Semaphore for the queue of monkeys wanting to cross in own direction
-    sem_t *semQueueOther;       // Semaphore for the queue of monkeys wanting to cross in the other direction
-    sem_t *semDirOwn;           // Semaphore for the monkey ready to cross in own direction
-    sem_t *semDirOther;         // Semaphore for the monkey ready to cross in the other direction
-    sem_t *semDirExcl;          // Semaphore to allow exclusive (atomic) access for operations on semDirOwn and semDirOther semaphores
-    sem_t *semFreePlaces;       // Semaphore to count remaining free places for monkeys crossing at the same time
-    sem_t *semFreePlacesExcl;   // Semaphore to allow exclusive (atomic) access for operations involving semFreePlaces semaphore
-
     // Open canyon semaphores, taking into account crossing direction:
-    if (direction == DIR_A_TO_B)
-    {
-        semQueueOwn   = Sem::open(canyon.getSemNameQueueAB());
-        semQueueOther = Sem::open(canyon.getSemNameQueueBA());
-        semDirOwn     = Sem::open(canyon.getSemNameDirAB());
-        semDirOther   = Sem::open(canyon.getSemNameDirBA());
-    }
-    else // (direction == DIR_B_TO_A)
-    {
-        semQueueOwn   = Sem::open(canyon.getSemNameQueueBA());
-        semQueueOther = Sem::open(canyon.getSemNameQueueAB());
-        semDirOwn     = Sem::open(canyon.getSemNameDirBA());
-        semDirOther   = Sem::open(canyon.getSemNameDirAB());
-    }
+    // semQueueOwn     : Semaphore for the queue of monkeys wanting to cross in own direction
+    // semQueueOther   : Semaphore for the queue of monkeys wanting to cross in the other direction
+    // semDirOwn       : Semaphore for the monkey ready to cross in own direction
+    // semDirOther     : Semaphore for the monkey ready to cross in the other direction
+    // semDirExcl      : Semaphore to allow exclusive (atomic) access for operations on semDirOwn and semDirOther semaphores
+    // semFreePlaces   : Semaphore to count remaining free places for monkeys crossing at the same time
+    // semDirOtherExcl : Semaphore to allow exclusive (atomic) access for operations involving semDirOther semaphore
 
-    semDirExcl        = Sem::open(canyon.getSemNameDirExcl());
-    semFreePlacesExcl = Sem::open(canyon.getSemNameFreePlacesExcl());
-    semFreePlaces     = Sem::open(canyon.getSemNameFreePlaces());
+    Sem semQueueOwn    (direction == DIR_A_TO_B ? canyon.getSemNameQueueAB() : canyon.getSemNameQueueBA());
+    Sem semQueueOther  (direction == DIR_A_TO_B ? canyon.getSemNameQueueBA() : canyon.getSemNameQueueAB());
+    Sem semDirOwn      (direction == DIR_A_TO_B ? canyon.getSemNameDirAB()   : canyon.getSemNameDirBA());
+    Sem semDirOther    (direction == DIR_A_TO_B ? canyon.getSemNameDirBA()   : canyon.getSemNameDirAB());
+    Sem semDirExcl     (canyon.getSemNameDirExcl());
+    Sem semFreePlaces  (canyon.getSemNameFreePlaces());
+    Sem semDirOtherExcl(canyon.getSemNameDirOtherExcl());
 
-    // Now the monkey crosses the canyon, waiting on various semaphores and passing through various states:
+    int maxFreePlaces = canyon.getMaxFreePlaces();
+
+    // Now the monkey crosses the canyon, waiting on the semaphores and passing through various states:
+
     logMessage(direction, STATE_IN_QUEUE);
 
-    Sem::wait(semQueueOwn);          // Wait on the queue in own direction
+    semQueueOwn.wait();          // Wait on the queue in own direction
 
     logMessage(direction, STATE_READY_TO_CROSS);
 
-    Sem::wait(semDirExcl);           // CRITICAL SECTION 1 (Dir): BEGIN (can be executed by one process at a time)
-    Sem::wait(semDirOwn);            //     Wait for allowed crossing in own direction
-    Sem::wait(semFreePlaces);        //     One more monkey crossing: subtract one to the available places
-    Sem::wait(semFreePlacesExcl);    //     CRITICAL SECTION 2 (FreePlaces): BEGIN (can be executed by one process at a time
-                                     //                                      and is mutually exclusive with critical section 3)
-    Sem::tryWait(semDirOther);       //         If not already forbidden, forbid crossing in the other direction
-    Sem::post(semFreePlacesExcl);    //     CRITICAL SECTION 2 (FreePlaces): END
-    Sem::post(semDirExcl);           // CRITICAL SECTION 1 (Dir): END
+    semDirExcl.wait();           // CRITICAL SECTION 1 (semDirExcl): BEGIN (can be executed by one process at a time)
+    semDirOwn.wait();            //     Wait for allowed crossing in own direction
+    semFreePlaces.wait();        //     One more monkey crossing: subtract one to the available places
+    semDirOtherExcl.wait();      //     CRITICAL SECTION 2 (semDirOtherExcl): BEGIN (can be executed by one process at a time
+                                 //                                           and is mutually exclusive with critical section 3)
+    semDirOther.tryWait();       //         If not already forbidden, forbid crossing in the other direction
+    semDirOtherExcl.post();      //     CRITICAL SECTION 2 (semDirOtherExcl): END
+    semDirExcl.post();           // CRITICAL SECTION 1 (semDirExcl): END
 
     logMessage(direction, STATE_GOING_TO_ROPE);
 
@@ -664,32 +644,27 @@ void Monkey::cross(Canyon canyon, Direction direction)
 
     logMessage(direction, STATE_CROSSING_ON_ROPE);
 
-    Sem::post(semDirOwn);            // Allow crossing in own direction
-    Sem::post(semQueueOwn);          // Unblock the queue in own direction
+    semDirOwn.post();            // Unlock crossing in own direction
+    semQueueOwn.post();          // Unlock the queue in own direction
 
     sleep(SECONDS_TO_CROSS_CANYON);
 
     logMessage(direction, STATE_FINISHED_CROSSING);
 
-    Sem::post(semFreePlaces);        // One less monkey crossing: add one to the available places
+    semFreePlaces.post();        // One less monkey crossing: add one to the available places
 
-    Sem::wait(semFreePlacesExcl);    // CRITICAL SECTION 3 (FreePlaces): BEGIN (can be executed by one process at a time
-                                     //                                  and is mutually exclusive with critical section 2)
-    if (Sem::getValue(semFreePlaces) == MAX_FREE_PLACES)
-                                     //     If crossing cleared
+    // If tryWait(semDirOther) is executed by somebody else just in between the following getValue(semFreePlaces)
+    // and post(semDirOther), semDirOther will result incorrectly unlocked.
+    // So both sections 2 and 3 must be protected by a mutually exclusive access, implemented by semDirOtherExcl:
+
+    semDirOtherExcl.wait();      // CRITICAL SECTION 3 (semDirOtherExcl): BEGIN (can be executed by one process at a time
+                                 //                                       and is mutually exclusive with critical section 2)
+    if (semFreePlaces.getValue() == maxFreePlaces)
+                                 //     If crossing cleared
     {
-        Sem::post(semDirOther);      //         Allow crossing in the other direction
+        semDirOther.post();      //         Unlock crossing in the other direction
     }
-    Sem::post(semFreePlacesExcl);    // CRITICAL SECTION 3 (FreePlaces): END
-
-    // Close canyon semaphores:
-    Sem::close(semQueueOwn);
-    Sem::close(semQueueOther);
-    Sem::close(semDirExcl);
-    Sem::close(semDirOwn);
-    Sem::close(semDirOther);
-    Sem::close(semFreePlacesExcl);
-    Sem::close(semFreePlaces);
+    semDirOtherExcl.post();      // CRITICAL SECTION 3 (semDirOtherExcl): END
 }
 
 void Monkey::logMessage(Direction direction, State state)
@@ -729,11 +704,11 @@ void Monkey::logMessage(Direction direction, State state)
 
     static const size_t MAX_DESCRIPTION_LEN = 34;   // See description string length ruler above
 
-    static const size_t MAX_EXTRA_CHARS_LEN = 16;   // Added spaces, periods etc. in message (see snprintf format string below)
+    static const size_t MAX_EXTRA_CHARS_LEN = 16;   // Added spaces, periods etc. in message (from snprintf format string below)
 
     static const size_t MAX_SIZE = MAX_DRAWING_LEN + MAX_DESCRIPTION_LEN + MAX_EXTRA_CHARS_LEN + 1;
 
-    // Use local scope (stack allocated), limited size message buffer instead of heap allocated string (for MISRA compliance):
+    // Use local scope (stack allocated), limited size message buffer instead of heap allocated string (improves MISRA compliance):
     char message[MAX_SIZE];
 
     // Print message depending on direction and state:
@@ -747,9 +722,9 @@ void Monkey::logMessage(Direction direction, State state)
 
 
 /*******************************************************************************
- Function prototypes:
+ Functions prototypes:
 *******************************************************************************/
-int  monkeysCrossing(long monkeysInRun);
+int  monkeysCrossing(long monkeysToBeGenerated);
 int  main(int argc, char **argv);
 
 /*******************************************************************************
@@ -757,15 +732,15 @@ int  main(int argc, char **argv);
 *******************************************************************************/
 
 /*******************************************************************************
-Procedure:   int monkeysCrossing()
+Procedure:   int  monkeysCrossing()
 
-Parameters:  int monkeysInRun: number of monkeys to be generated.
+Parameters:  long monkeysToBeGenerated: number of monkeys to be generated.
 
 Description: this procedure:
              - prepares the environment for the monkeys,
-             - generates monkeys processes and tells them to cross the canyon.
+             - generates monkeys processes and orders them to cross the canyon.
 *******************************************************************************/
-int monkeysCrossing(long monkeysInRun)
+int monkeysCrossing(long monkeysToBeGenerated)
 {
     int               monkeyId;
     int               monkeysInGroup;
@@ -776,6 +751,7 @@ int monkeysCrossing(long monkeysInRun)
 
     try
     {
+        // Instantiate canyon object:
         Canyon        canyon(SEM_NAME_QUEUE_EAST_WEST,  SEM_NAME_QUEUE_WEST_EAST,
                              SEM_NAME_DIR_EAST_WEST,    SEM_NAME_DIR_WEST_EAST,
                              SEM_NAME_DIR_EXCL,         SEM_NAME_FREE_PLACES,
@@ -791,30 +767,30 @@ int monkeysCrossing(long monkeysInRun)
         }
 
         // Print header:
-        Logger::print("\n MONKEY PROBLEM\n", false);
-        Logger::print(" Symbols description:\n", false);
-        Logger::print(" TIM     = TIMe in seconds from the beginning", false);
-        Logger::print(" Q       = west and east Queue semaphores", false);
-        Logger::print(" D       = west and east Direction semaphores", false);
-        Logger::print(" ROPE    = the ROPE, of course", false);
-        Logger::print(" MESSAGE = monkey state MESSAGE", false);
-        Logger::print(" >       = eastward going monkey", false);
-        Logger::print(" <       = westward going monkey", false);
-        Logger::print("\nTIM:   Q D  ROPE  D Q   MESSAGE\n", false);
+        Logger::print("\n MONKEY PROBLEM\n");
+        Logger::print(" Symbols description:\n");
+        Logger::print(" TIM     = TIMe in seconds from the beginning");
+        Logger::print(" Q       = west and east Queue semaphores");
+        Logger::print(" D       = west and east Direction semaphores");
+        Logger::print(" ROPE    = the ROPE, of course");
+        Logger::print(" MESSAGE = monkey state MESSAGE");
+        Logger::print(" >       = eastward going monkey");
+        Logger::print(" <       = westward going monkey");
+        Logger::print("\nTIM:   Q D  ROPE  D Q   MESSAGE\n");
 
         Logger::resetZeroTime();
 
         // Monkey generation loop:
         monkeyId = 0;
-        while (monkeyId < monkeysInRun)
+        while (monkeyId < monkeysToBeGenerated)
         {
             direction = (Monkey::Direction)(rand() % Monkey::DIR_NUMBER);  // Direction to cross for the monkeys of this group
             monkeysInGroup = (rand() % (MAX_MONKEYS_NUMBER_IN_GROUP - MIN_MONKEYS_NUMBER_IN_GROUP + 1)) + MIN_MONKEYS_NUMBER_IN_GROUP;
 
-            if (monkeyId + monkeysInGroup > monkeysInRun)
+            if (monkeyId + monkeysInGroup > monkeysToBeGenerated)
             {
-                // monkeyId would overflow monkeysInRun: reduce it to the maximum allowed:
-                monkeysInGroup = monkeysInRun - monkeyId;
+                // monkeyId would overflow monkeysToBeGenerated: reduce monkeysInGroup to the maximum allowed:
+                monkeysInGroup = monkeysToBeGenerated - monkeyId;
             }
 
             lastMonkeyIdInGroup = monkeyId + monkeysInGroup;
@@ -824,7 +800,7 @@ int monkeysCrossing(long monkeysInRun)
             {
                 monkeyId++;
 
-                if (monkeyId == monkeysInRun)
+                if (monkeyId == monkeysToBeGenerated)
                 {
                     // This is the last child: parent process will wait for its termination, so SIGCHLD must not be ignored any more:
                     if (signal(SIGCHLD, SIG_DFL) == SIG_ERR)
@@ -840,10 +816,10 @@ int monkeysCrossing(long monkeysInRun)
                 {
                     // Child process
 
-                    // Instantiate the monkey:
+                    // Instantiate the monkey object:
                     Monkey monkey(monkeyId);
 
-                    // Tell the monkey to cross the canyon in the desired direction:
+                    // Order the monkey to cross the canyon in the desired direction:
                     monkey.cross(canyon, direction);
 
                     // child exits:
@@ -855,7 +831,7 @@ int monkeysCrossing(long monkeysInRun)
                 }
             }
 
-            if (monkeyId < monkeysInRun) // if more monkeys remain to generate
+            if (monkeyId < monkeysToBeGenerated)
             {
                 secondsBeforeNextGroup = rand() % (MAX_SECONDS_BETWEEN_GROUPS - MIN_SECONDS_BETWEEN_GROUPS + 1) + MIN_SECONDS_BETWEEN_GROUPS;
                 sleep((unsigned int)secondsBeforeNextGroup);
@@ -866,7 +842,7 @@ int monkeysCrossing(long monkeysInRun)
         while (wait((int*)NULL) > 0);
 
         Logger::print("Parent process: last child terminated.", true);
-        Logger::print("Parent process: goodbye.", false);
+        Logger::print("Parent process: goodbye.");
 
         return EXIT_SUCCESS;
     }
@@ -886,22 +862,21 @@ Parameters:  int argc:    number of arguments.
                           argv[1] contains the number of monkeys to be generated.
 
 Description: receives the number of monkeys to be generated and calls
-             the monkey crossing function.
+             the monkeyCrossing function.
 *******************************************************************************/
 int main (int argc, char **argv)
 {
-    // Number of monkeys to be generated:
-    long monkeysInRun;
+    long monkeysToBeGenerated;
 
     // Pointer to the char after the digits:
     char* pEnd;
 
-    // argv[1] contains the number of monkeys to be generated in a run. Read it:
+    // argv[1] contains the number of monkeys to be generated in this run. Read it:
     if ((argc != 2)
         ||
-        ((monkeysInRun = strtol(argv[1], &pEnd, 10)) < MIN_MONKEYS_NUMBER)
+        ((monkeysToBeGenerated = strtol(argv[1], &pEnd, 10)) < MIN_MONKEYS_NUMBER)
         ||
-        (monkeysInRun > MAX_MONKEYS_NUMBER)
+        (monkeysToBeGenerated > MAX_MONKEYS_NUMBER)
         ||
         (*pEnd != '\0'))    // There are extra characters after the digits
     {
@@ -910,5 +885,5 @@ int main (int argc, char **argv)
         return(EXIT_FAILURE);
     }
 
-    return monkeysCrossing(monkeysInRun);
+    return monkeysCrossing(monkeysToBeGenerated);
 }
